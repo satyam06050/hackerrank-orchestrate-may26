@@ -223,8 +223,32 @@ class TicketTriageAgent:
         return selected, confidence
     
     @staticmethod
+    def _is_response_grounded(response: str, chunks: List[Dict]) -> bool:
+        """Verify response is grounded in corpus (prevents hallucination).
+        
+        Returns True only if response contains substantial overlap with corpus text.
+        """
+        if not chunks or not response:
+            return False
+        
+        # Get all corpus text
+        corpus_text = " ".join([c["text"] for c in chunks]).lower()
+        response_lower = response.lower()
+        
+        # Check for key phrases from corpus appearing in response
+        # At least 40% of response content must be from corpus
+        response_words = set(response_lower.split())
+        corpus_words = set(corpus_text.split())
+        
+        if not response_words:
+            return False
+        
+        overlap = len(response_words & corpus_words) / len(response_words)
+        return overlap >= 0.40  # 40% threshold ensures grounding
+    
+    @staticmethod
     def generate_response(chunks: List[Dict], request_type: str, product_area: str) -> str:
-        """Generate response based on retrieved chunks."""
+        """Generate response based on retrieved chunks (grounded in corpus)."""
         if not chunks:
             return "Unable to find relevant information in our knowledge base. Please contact support for further assistance."
         
@@ -252,6 +276,10 @@ class TicketTriageAgent:
         # Final truncate if still too long
         if len(combined_response) > 800:
             combined_response = combined_response[:800] + "..."
+        
+        # Verify response is grounded in corpus
+        if not TicketTriageAgent._is_response_grounded(combined_response, chunks):
+            return "Unable to provide a reliable answer based on available documentation. Please contact support."
         
         return combined_response
     
@@ -305,8 +333,22 @@ class TicketTriageAgent:
         # Generate response
         response = self.generate_response(chunks, request_type, product_area)
         
+        # Safety check: Verify response is grounded
+        # If we can't verify grounding, escalate to be safe
+        is_grounded = self._is_response_grounded(response, chunks)
+        if not is_grounded and chunks:
+            # Response quality is poor, escalate
+            confidence = 0.0
+            response = "Unable to provide a reliable answer based on available documentation. Please contact support."
+        
         # Step 7: Decision logic
         status = self.decide_status(risk, confidence, request_type)
+        
+        # Additional safety: if response suggests escalation, honor it
+        if "contact support" in response.lower() and "please" in response.lower():
+            # Fallback message suggests we should escalate
+            if status == "Replied" and confidence < 0.20:
+                status = "Escalated"
         
         # Build detailed justification
         reason_parts = []
@@ -318,6 +360,8 @@ class TicketTriageAgent:
             reason_parts.append("low_confidence")
         if risk == "MEDIUM" and confidence < 0.30:
             reason_parts.append("medium_risk_low_confidence")
+        if not is_grounded and chunks:
+            reason_parts.append("grounding_check_failed")
         
         reason = "; ".join(reason_parts) if reason_parts else "sufficient_confidence"
         justification = f"Domain:{domain}|Type:{request_type}|Risk:{risk}|Confidence:{confidence:.2f}|Reason:{reason}"
